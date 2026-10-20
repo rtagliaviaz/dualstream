@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>SFU Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 16px;
+            background: #111;
+            color: #eee;
+            font-family: system-ui, sans-serif;
+        }
+        h1 { font-size: 18px; margin: 0 0 16px 0; }
+        video {
+            width: 100%;
+            max-width: 800px;
+            background: black;
+            display: block;
+            border-radius: 8px;
+        }
+        .controls {
+            margin: 16px 0;
+            display: flex;
+            gap: 8px;
+        }
+        button {
+            padding: 8px 16px;
+            font-size: 16px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background: #222;
+            color: #eee;
+            cursor: pointer;
+        }
+        button.active { background: #2a4; border-color: #2a4; }
+        #status { margin-top: 12px; font-size: 14px; color: #aaa; }
+        #stats { margin-top: 8px; font-size: 12px; color: #666; white-space: pre; }
+    </style>
+</head>
+<body>
+    <h1>SFU Viewer</h1>
+
+    <div class="controls">
+        <button data-rid="h">High (h)</button>
+        <button data-rid="m">Medium (m)</button>
+        <button data-rid="l">Low (l)</button>
+    </div>
+
+    <video id="video" autoplay playsinline muted></video>
+
+    <div id="status">pick a layer above</div>
+    <pre id="stats"></pre>
+
+    <script>
+    const video = document.getElementById('video');
+    const statusEl = document.getElementById('status');
+    const statsEl = document.getElementById('stats');
+    const buttons = document.querySelectorAll('button[data-rid]');
+
+    let pc = null;
+
+    async function subscribe(rid) {
+        if (pc) {
+            pc.close();
+            pc = null;
+        }
+
+        // Mark the active button.
+        buttons.forEach(b => {
+            b.classList.toggle('active', b.dataset.rid === rid);
+        });
+
+        statusEl.textContent = 'creating peer connection for layer "' + rid + '"...';
+
+        pc = new RTCPeerConnection();
+
+        // We only want to receive video.
+        pc.addTransceiver('video', { direction: 'recvonly' });
+
+        pc.ontrack = (event) => {
+            statusEl.textContent = 'got track: ' + event.track.kind + ' (layer ' + rid + ')';
+            video.srcObject = event.streams[0];
+        };
+
+        pc.onconnectionstatechange = () => {
+            statusEl.textContent = 'connection: ' + pc.connectionState + ' (layer ' + rid + ')';
+        };
+
+        // Start collecting stats so we can see what's flowing.
+        setInterval(async () => {
+            if (!pc) return;
+            const stats = await pc.getStats();
+            let inbound = null;
+            stats.forEach(report => {
+                if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                    inbound = report;
+                }
+            });
+            if (inbound) {
+                statsEl.textContent =
+                    'packets: ' + (inbound.packetsReceived || 0) + '\n' +
+                    'bytes:   ' + (inbound.bytesReceived || 0) + '\n' +
+                    'jitter:  ' + (inbound.jitter ? inbound.jitter.toFixed(4) : 'n/a') + '\n' +
+                    'frameW:  ' + (inbound.frameWidth || '?') + '\n' +
+                    'frameH:  ' + (inbound.frameHeight || '?');
+            }
+        }, 1000);
+
+        // Create the offer.
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+
+        // Wait for ICE gathering to finish (non-trickle).
+        await new Promise(resolve => {
+            if (pc.iceGatheringState === 'complete') return resolve();
+            pc.onicegatheringstatechange = () => {
+                if (pc.iceGatheringState === 'complete') resolve();
+            };
+        });
+
+        // Send the offer to the SFU.
+        statusEl.textContent = 'sending offer to SFU...';
+        let resp;
+        try {
+            resp = await fetch('/subscribe?rid=' + encodeURIComponent(rid), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(pc.localDescription),
+            });
+        } catch (err) {
+            statusEl.textContent = 'network error: ' + err.message;
+            return;
+        }
+
+        if (!resp.ok) {
+            const text = await resp.text();
+            statusEl.textContent = 'subscribe failed (' + resp.status + '): ' + text;
+            return;
+        }
+
+        const answer = await resp.json();
+        await pc.setRemoteDescription(answer);
+
+        statusEl.textContent = 'subscribed to "' + rid + '". waiting for video...';
+    }
+
+    buttons.forEach(b => {
+        b.addEventListener('click', () => {
+            subscribe(b.dataset.rid).catch(err => {
+                statusEl.textContent = 'error: ' + err.message;
+            });
+        });
+    });
+    </script>
+</body>
+</html>

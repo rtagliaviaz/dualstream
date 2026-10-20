@@ -1,0 +1,19 @@
+# Build artifacts
+*.exe
+*.out
+
+# Generated media
+*.ivf
+*.mp4
+*.mkv
+*.ts
+*.m4s
+*.m3u8
+
+# Local dev
+.env
+*.log
+
+# IDE
+.vscode/
+.idea/
