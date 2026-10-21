@@ -60,36 +60,81 @@
     const buttons = document.querySelectorAll('button[data-rid]');
 
     let pc = null;
+    let statsInterval = null;
+    let currentLayer = null;
+    let connectionState = 'new';
+
+    // Maps a video resolution to a layer name. Used to detect when the SFU
+    // switches us to a different layer behind our back. Only works when
+    // each layer has a distinct resolution. If all layers share the same
+    // resolution (e.g. "bitrate layers"), detection is impossible from the
+    // client side without an explicit signaling channel from the server.
+    function layerFromResolution(w, h) {
+        if (w === 0 || h === 0) return null;
+        if (h >= 700) return 'h';
+        if (h >= 400) return 'm';
+        if (h >= 300) return 'l';
+        return null;
+    }
+
+    function updateUI() {
+        // Highlight the button that matches the current layer.
+        buttons.forEach(b => {
+            b.classList.toggle('active', b.dataset.rid === currentLayer);
+        });
+
+        // Update the status line.
+        if (connectionState === 'connected' && currentLayer) {
+            statusEl.textContent = 'connection: connected (layer ' + currentLayer + ')';
+        } else {
+            statusEl.textContent = 'connection: ' + connectionState;
+        }
+    }
+
+    // The video element fires 'resize' whenever videoWidth or videoHeight
+    // change. That happens when the decoder sees frames of a different
+    // resolution, which in turn happens when the SFU switches our layer.
+    video.addEventListener('resize', () => {
+        const detected = layerFromResolution(video.videoWidth, video.videoHeight);
+        if (detected && detected !== currentLayer) {
+            console.log(
+                'layer change detected:', currentLayer, '->', detected,
+                '(' + video.videoWidth + 'x' + video.videoHeight + ')'
+            );
+            currentLayer = detected;
+            updateUI();
+        }
+    });
 
     async function subscribe(rid) {
+        if (statsInterval) {
+            clearInterval(statsInterval);
+            statsInterval = null;
+        }
         if (pc) {
             pc.close();
             pc = null;
         }
 
-        // Mark the active button.
-        buttons.forEach(b => {
-            b.classList.toggle('active', b.dataset.rid === rid);
-        });
+        currentLayer = rid;
+        connectionState = 'new';
+        updateUI();
 
         statusEl.textContent = 'creating peer connection for layer "' + rid + '"...';
 
         pc = new RTCPeerConnection();
-
-        // We only want to receive video.
         pc.addTransceiver('video', { direction: 'recvonly' });
 
         pc.ontrack = (event) => {
-            statusEl.textContent = 'got track: ' + event.track.kind + ' (layer ' + rid + ')';
             video.srcObject = event.streams[0];
         };
 
         pc.onconnectionstatechange = () => {
-            statusEl.textContent = 'connection: ' + pc.connectionState + ' (layer ' + rid + ')';
+            connectionState = pc.connectionState;
+            updateUI();
         };
 
-        // Start collecting stats so we can see what's flowing.
-        setInterval(async () => {
+        statsInterval = setInterval(async () => {
             if (!pc) return;
             const stats = await pc.getStats();
             let inbound = null;
@@ -103,16 +148,15 @@
                     'packets: ' + (inbound.packetsReceived || 0) + '\n' +
                     'bytes:   ' + (inbound.bytesReceived || 0) + '\n' +
                     'jitter:  ' + (inbound.jitter ? inbound.jitter.toFixed(4) : 'n/a') + '\n' +
-                    'frameW:  ' + (inbound.frameWidth || '?') + '\n' +
-                    'frameH:  ' + (inbound.frameHeight || '?');
+                    'frameW:  ' + (video.videoWidth || '?') + '\n' +
+                    'frameH:  ' + (video.videoHeight || '?') + '\n' +
+                    'layer:   ' + (currentLayer || 'unknown');
             }
         }, 1000);
 
-        // Create the offer.
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
-        // Wait for ICE gathering to finish (non-trickle).
         await new Promise(resolve => {
             if (pc.iceGatheringState === 'complete') return resolve();
             pc.onicegatheringstatechange = () => {
@@ -120,7 +164,6 @@
             };
         });
 
-        // Send the offer to the SFU.
         statusEl.textContent = 'sending offer to SFU...';
         let resp;
         try {
@@ -142,8 +185,6 @@
 
         const answer = await resp.json();
         await pc.setRemoteDescription(answer);
-
-        statusEl.textContent = 'subscribed to "' + rid + '". waiting for video...';
     }
 
     buttons.forEach(b => {
@@ -153,6 +194,17 @@
             });
         });
     });
+
+    updateUI();
     </script>
 </body>
-</html>
+</html>git add .
+git commit -m "feat: dynamic layer switching based on REMB
+
+- SFU measures per-layer bitrate and switches viewers based on it
+- Stable SSRC and sequence numbers across layer switches
+- Frame-boundary alignment prevents decoder artifacts
+- Broadcaster handoff drops packets until frame boundary
+
+Known limitation: restarting any component requires restarting all
+(SFU, bridge, GStreamer, viewer) to reestablish clean state."
