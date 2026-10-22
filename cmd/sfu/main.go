@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,8 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+
+	"github.com/rtagliaviaz/dualstream/internal/hls"
 )
 
 var layerBitrates = map[string]uint64{
@@ -34,6 +37,7 @@ type SFUServer struct {
 	broadcaster  *webrtc.PeerConnection
 	layers       map[string]*layerState
 	debugBitrate uint64
+	hls          *hls.Server
 }
 
 type layerState struct {
@@ -66,20 +70,33 @@ type viewerConn struct {
 }
 
 func main() {
-	sfu := &SFUServer{layers: make(map[string]*layerState)}
+	hlsDir := os.Getenv("HLS_DIR")
+	if hlsDir == "" {
+		hlsDir = "./hls"
+	}
+
+	sfu := &SFUServer{
+		layers: make(map[string]*layerState),
+		hls:    hls.New(hlsDir),
+	}
 
 	http.Handle("/", http.FileServer(http.Dir("cmd/sfu/static")))
 	http.HandleFunc("/broadcast", sfu.handleBroadcast)
 	http.HandleFunc("/subscribe", sfu.handleSubscribe)
 	http.HandleFunc("/layers", sfu.handleLayers)
 	http.HandleFunc("/debug/bitrate", sfu.handleDebugBitrate)
+	http.HandleFunc("/hls/info", sfu.handleHLSInfo)
+	http.Handle("/hls/", sfu.hls)
 
 	log.Println("SFU listening on :8080")
+	log.Printf("  HLS_DIR                   → %s", hlsDir)
 	log.Println("  GET  /                    → HTML viewer")
 	log.Println("  POST /broadcast           → broadcaster publishes 3 layers")
 	log.Println("  POST /subscribe?rid=h|m|l → viewer receives one layer")
 	log.Println("  GET  /layers              → list layers with measured bitrate")
 	log.Println("  POST /debug/bitrate?bps=N → force bitrate (0 = clear)")
+	log.Println("  GET  /hls/info            → HLS availability snapshot (JSON)")
+	log.Println("  GET  /hls/master.m3u8     → HLS master playlist (fallback)")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 }
 
@@ -540,6 +557,14 @@ func (s *SFUServer) handleDebugBitrate(w http.ResponseWriter, r *http.Request) {
 	} else {
 		fmt.Fprintln(w, "bitrate override cleared")
 	}
+}
+
+// handleHLSInfo returns a JSON snapshot of the HLS fallback state so the
+// browser can decide whether to try HLS before creating a peer connection.
+func (s *SFUServer) handleHLSInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(s.hls.Snapshot())
 }
 
 func newPeerConnection() (*webrtc.PeerConnection, error) {

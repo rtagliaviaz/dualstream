@@ -1,210 +1,31 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="es">
 <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>SFU Viewer</title>
-    <style>
-        body {
-            margin: 0;
-            padding: 16px;
-            background: #111;
-            color: #eee;
-            font-family: system-ui, sans-serif;
-        }
-        h1 { font-size: 18px; margin: 0 0 16px 0; }
-        video {
-            width: 100%;
-            max-width: 800px;
-            background: black;
-            display: block;
-            border-radius: 8px;
-        }
-        .controls {
-            margin: 16px 0;
-            display: flex;
-            gap: 8px;
-        }
-        button {
-            padding: 8px 16px;
-            font-size: 16px;
-            border-radius: 6px;
-            border: 1px solid #444;
-            background: #222;
-            color: #eee;
-            cursor: pointer;
-        }
-        button.active { background: #2a4; border-color: #2a4; }
-        #status { margin-top: 12px; font-size: 14px; color: #aaa; }
-        #stats { margin-top: 8px; font-size: 12px; color: #666; white-space: pre; }
-    </style>
+<meta charset="utf-8">
+<title>DualStream — WebRTC + HLS</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 1.5rem; }
+  h1 { font-weight: 500; margin: 0 0 .5rem; }
+  #status { font-family: monospace; font-size: .85rem; color: #8f8; margin-bottom: .75rem; min-height: 1.2em; }
+  video { width: 100%; max-width: 960px; background: #000; border-radius: 6px; display: block; }
+  .controls { margin-top: 1rem; display: flex; gap: .5rem; flex-wrap: wrap; }
+  button { padding: .5rem .9rem; border: 1px solid #444; background: #222; color: #eee; border-radius: 4px; cursor: pointer; }
+  button:hover { background: #333; }
+  button.active { background: #2a5; border-color: #2a5; color: #000; }
+  #mode-badge { display: inline-block; padding: .15rem .5rem; border-radius: 4px; font-size: .8rem; background: #444; margin-left: .5rem; }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 </head>
 <body>
-    <h1>SFU Viewer</h1>
-
-    <div class="controls">
-        <button data-rid="h">High (h)</button>
-        <button data-rid="m">Medium (m)</button>
-        <button data-rid="l">Low (l)</button>
-    </div>
-
-    <video id="video" autoplay playsinline muted></video>
-
-    <div id="status">pick a layer above</div>
-    <pre id="stats"></pre>
-
-    <script>
-    const video = document.getElementById('video');
-    const statusEl = document.getElementById('status');
-    const statsEl = document.getElementById('stats');
-    const buttons = document.querySelectorAll('button[data-rid]');
-
-    let pc = null;
-    let statsInterval = null;
-    let currentLayer = null;
-    let connectionState = 'new';
-
-    // Maps a video resolution to a layer name. Used to detect when the SFU
-    // switches us to a different layer behind our back. Only works when
-    // each layer has a distinct resolution. If all layers share the same
-    // resolution (e.g. "bitrate layers"), detection is impossible from the
-    // client side without an explicit signaling channel from the server.
-    function layerFromResolution(w, h) {
-        if (w === 0 || h === 0) return null;
-        if (h >= 700) return 'h';
-        if (h >= 400) return 'm';
-        if (h >= 300) return 'l';
-        return null;
-    }
-
-    function updateUI() {
-        // Highlight the button that matches the current layer.
-        buttons.forEach(b => {
-            b.classList.toggle('active', b.dataset.rid === currentLayer);
-        });
-
-        // Update the status line.
-        if (connectionState === 'connected' && currentLayer) {
-            statusEl.textContent = 'connection: connected (layer ' + currentLayer + ')';
-        } else {
-            statusEl.textContent = 'connection: ' + connectionState;
-        }
-    }
-
-    // The video element fires 'resize' whenever videoWidth or videoHeight
-    // change. That happens when the decoder sees frames of a different
-    // resolution, which in turn happens when the SFU switches our layer.
-    video.addEventListener('resize', () => {
-        const detected = layerFromResolution(video.videoWidth, video.videoHeight);
-        if (detected && detected !== currentLayer) {
-            console.log(
-                'layer change detected:', currentLayer, '->', detected,
-                '(' + video.videoWidth + 'x' + video.videoHeight + ')'
-            );
-            currentLayer = detected;
-            updateUI();
-        }
-    });
-
-    async function subscribe(rid) {
-        if (statsInterval) {
-            clearInterval(statsInterval);
-            statsInterval = null;
-        }
-        if (pc) {
-            pc.close();
-            pc = null;
-        }
-
-        currentLayer = rid;
-        connectionState = 'new';
-        updateUI();
-
-        statusEl.textContent = 'creating peer connection for layer "' + rid + '"...';
-
-        pc = new RTCPeerConnection();
-        pc.addTransceiver('video', { direction: 'recvonly' });
-
-        pc.ontrack = (event) => {
-            video.srcObject = event.streams[0];
-        };
-
-        pc.onconnectionstatechange = () => {
-            connectionState = pc.connectionState;
-            updateUI();
-        };
-
-        statsInterval = setInterval(async () => {
-            if (!pc) return;
-            const stats = await pc.getStats();
-            let inbound = null;
-            stats.forEach(report => {
-                if (report.type === 'inbound-rtp' && report.kind === 'video') {
-                    inbound = report;
-                }
-            });
-            if (inbound) {
-                statsEl.textContent =
-                    'packets: ' + (inbound.packetsReceived || 0) + '\n' +
-                    'bytes:   ' + (inbound.bytesReceived || 0) + '\n' +
-                    'jitter:  ' + (inbound.jitter ? inbound.jitter.toFixed(4) : 'n/a') + '\n' +
-                    'frameW:  ' + (video.videoWidth || '?') + '\n' +
-                    'frameH:  ' + (video.videoHeight || '?') + '\n' +
-                    'layer:   ' + (currentLayer || 'unknown');
-            }
-        }, 1000);
-
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-
-        await new Promise(resolve => {
-            if (pc.iceGatheringState === 'complete') return resolve();
-            pc.onicegatheringstatechange = () => {
-                if (pc.iceGatheringState === 'complete') resolve();
-            };
-        });
-
-        statusEl.textContent = 'sending offer to SFU...';
-        let resp;
-        try {
-            resp = await fetch('/subscribe?rid=' + encodeURIComponent(rid), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(pc.localDescription),
-            });
-        } catch (err) {
-            statusEl.textContent = 'network error: ' + err.message;
-            return;
-        }
-
-        if (!resp.ok) {
-            const text = await resp.text();
-            statusEl.textContent = 'subscribe failed (' + resp.status + '): ' + text;
-            return;
-        }
-
-        const answer = await resp.json();
-        await pc.setRemoteDescription(answer);
-    }
-
-    buttons.forEach(b => {
-        b.addEventListener('click', () => {
-            subscribe(b.dataset.rid).catch(err => {
-                statusEl.textContent = 'error: ' + err.message;
-            });
-        });
-    });
-
-    updateUI();
-    </script>
+  <h1>DualStream <span id="mode-badge">desconectado</span></h1>
+  <div id="status">Iniciando…</div>
+  <video id="video" autoplay muted playsinline></video>
+  <div class="controls">
+    <button data-rid="h">High (720p)</button>
+    <button data-rid="m">Medium (480p)</button>
+    <button data-rid="l">Low (360p)</button>
+    <button id="toggle-mode">Cambiar a HLS</button>
+  </div>
+  <script src="player.js?v=3"></script>
 </body>
-</html>git add .
-git commit -m "feat: dynamic layer switching based on REMB
-
-- SFU measures per-layer bitrate and switches viewers based on it
-- Stable SSRC and sequence numbers across layer switches
-- Frame-boundary alignment prevents decoder artifacts
-- Broadcaster handoff drops packets until frame boundary
-
-Known limitation: restarting any component requires restarting all
-(SFU, bridge, GStreamer, viewer) to reestablish clean state."
+</html>
