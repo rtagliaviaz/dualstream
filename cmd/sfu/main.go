@@ -19,18 +19,18 @@ import (
 	"github.com/rtagliaviaz/dualstream/internal/hls"
 )
 
-var layerBitrates = map[string]uint64{
-	"h": 2_000_000,
-	"m": 1_000_000,
-	"l": 500_000,
-}
-
 var layerOrder = []string{"h", "m", "l"}
 
 const switchCooldown = 10 * time.Second
 const upscaleFactor = 1.5
 const downscaleFactor = 0.8
 const timestampStep uint32 = 3000
+
+// Lifecycle tunables.
+const (
+	layerInactivityTimeout = 5 * time.Second
+	lifecycleTickInterval  = 2 * time.Second
+)
 
 type SFUServer struct {
 	mu           sync.RWMutex
@@ -46,16 +46,19 @@ type layerState struct {
 	viewers []*viewerConn
 
 	measuredBitrate uint64
+	lastPacket      atomic.Int64  // unix nano of last packet
+	done            chan struct{} // closed when layer is killed or replaced
 }
 
 type viewerConn struct {
-	mu         sync.RWMutex
-	pc         *webrtc.PeerConnection
-	sender     *webrtc.RTPSender
-	outTrack   *webrtc.TrackLocalStaticRTP
-	currentRID string
-	lastSwitch time.Time
-	lastREMB   uint64
+	mu           sync.RWMutex
+	pc           *webrtc.PeerConnection
+	sender       *webrtc.RTPSender
+	outTrack     *webrtc.TrackLocalStaticRTP
+	currentRID   string
+	currentLayer *layerState
+	lastSwitch   time.Time
+	lastREMB     uint64
 
 	// Stable stream identity across layer switches.
 	stableSSRC uint32
@@ -86,7 +89,10 @@ func main() {
 	http.HandleFunc("/layers", sfu.handleLayers)
 	http.HandleFunc("/debug/bitrate", sfu.handleDebugBitrate)
 	http.HandleFunc("/hls/info", sfu.handleHLSInfo)
+	http.HandleFunc("/reset", sfu.handleReset)
 	http.Handle("/hls/", sfu.hls)
+
+	go sfu.lifecycleMonitor()
 
 	log.Println("SFU listening on :8080")
 	log.Printf("  HLS_DIR                   → %s", hlsDir)
@@ -97,6 +103,7 @@ func main() {
 	log.Println("  POST /debug/bitrate?bps=N → force bitrate (0 = clear)")
 	log.Println("  GET  /hls/info            → HLS availability snapshot (JSON)")
 	log.Println("  GET  /hls/master.m3u8     → HLS master playlist (fallback)")
+	log.Println("  POST /reset               → close broadcaster and all viewers")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 }
 
@@ -118,28 +125,67 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		rid := track.RID()
 		log.Printf("[layer %s] arrived SSRC=%d", rid, track.SSRC())
 
-		ls := &layerState{source: track}
+		newLs := &layerState{
+			source: track,
+			done:   make(chan struct{}),
+		}
+		newLs.lastPacket.Store(time.Now().UnixNano())
 
 		s.mu.Lock()
-		s.layers[rid] = ls
+		oldLs := s.layers[rid]
+		s.layers[rid] = newLs
 		s.mu.Unlock()
 
+		// Migrate viewers from the old layer, if any. This is the
+		// broadcaster-replacement case: same RID, new source track.
+		var migrated []*viewerConn
+		if oldLs != nil {
+			oldLs.mu.Lock()
+			migrated = oldLs.viewers
+			oldLs.viewers = nil
+			oldLs.mu.Unlock()
+			close(oldLs.done)
+			if len(migrated) > 0 {
+				log.Printf("[layer %s] replacing source, migrating %d viewers", rid, len(migrated))
+			}
+		}
+
+		for _, v := range migrated {
+			v.mu.Lock()
+			v.currentLayer = newLs
+			v.dropUntilFrameEnd = true
+			v.lastSwitch = time.Now()
+			v.mu.Unlock()
+		}
+
+		newLs.mu.Lock()
+		newLs.viewers = append(newLs.viewers, migrated...)
+		newLs.mu.Unlock()
+
 		var bytesThisSecond atomic.Uint64
+
+		// Bitrate ticker. Stops when the layer is killed or replaced.
 		go func() {
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
-			for range ticker.C {
-				bitrate := bytesThisSecond.Swap(0) * 8
-				ls.mu.Lock()
-				ls.measuredBitrate = bitrate
-				ls.mu.Unlock()
+			for {
+				select {
+				case <-newLs.done:
+					return
+				case <-ticker.C:
+					bitrate := bytesThisSecond.Swap(0) * 8
+					newLs.mu.Lock()
+					newLs.measuredBitrate = bitrate
+					newLs.mu.Unlock()
+				}
 			}
 		}()
 
+		// Read loop.
 		go func() {
 			buf := make([]byte, 1500)
 			pkt := &rtp.Packet{}
@@ -150,10 +196,11 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				bytesThisSecond.Add(uint64(n))
+				newLs.lastPacket.Store(time.Now().UnixNano())
 
-				ls.mu.RLock()
-				viewers := append([]*viewerConn{}, ls.viewers...)
-				ls.mu.RUnlock()
+				newLs.mu.RLock()
+				viewers := append([]*viewerConn{}, newLs.viewers...)
+				newLs.mu.RUnlock()
 
 				for _, v := range viewers {
 					if err := pkt.Unmarshal(buf[:n]); err != nil {
@@ -161,15 +208,14 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 					}
 
 					v.mu.Lock()
-					if v.currentRID != rid {
+					// currentLayer, not currentRID: distinguishes old
+					// and new layerStates with the same RID after a
+					// broadcaster replacement.
+					if v.currentLayer != newLs {
 						v.mu.Unlock()
 						continue
 					}
 
-					// Just switched: drop until we see the end of the
-					// current frame. The next packet after marker=true
-					// will be a clean frame start (a keyframe, since
-					// keyframe-max-dist=1).
 					if v.dropUntilFrameEnd {
 						v.lastMarker = pkt.Header.Marker
 						if pkt.Header.Marker {
@@ -202,6 +248,30 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("[broadcaster] state: %s", state.String())
+
+		// Failed or Closed are terminal; Disconnected is transient and
+		// is left to the inactivity monitor.
+		if state != webrtc.PeerConnectionStateFailed &&
+			state != webrtc.PeerConnectionStateClosed {
+			return
+		}
+
+		s.mu.Lock()
+		if s.broadcaster != pc {
+			s.mu.Unlock()
+			return
+		}
+		s.broadcaster = nil
+		rids := make([]string, 0, len(s.layers))
+		for rid := range s.layers {
+			rids = append(rids, rid)
+		}
+		s.mu.Unlock()
+
+		log.Printf("[broadcaster] connection ended, killing %d layer(s)", len(rids))
+		for _, rid := range rids {
+			s.killLayer(rid)
+		}
 	})
 
 	if _, err := pc.AddTransceiverFromKind(
@@ -230,9 +300,16 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 	}
 	<-gatherDone
 
+	// Install the new broadcaster, closing any previous one. The new
+	// OnTrack handlers above migrate viewers from the previous layers.
 	s.mu.Lock()
+	oldBc := s.broadcaster
 	s.broadcaster = pc
 	s.mu.Unlock()
+	if oldBc != nil && oldBc != pc {
+		log.Printf("[broadcaster] closing previous peer connection")
+		_ = oldBc.Close()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(pc.LocalDescription())
@@ -249,6 +326,7 @@ func (s *SFUServer) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		rid = "h"
 	}
 
+	// Wait up to 10 s for the layer to appear.
 	var ls *layerState
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -278,11 +356,13 @@ func (s *SFUServer) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	outTrack, err := webrtc.NewTrackLocalStaticRTP(
-		ls.source.Codec().RTPCodecCapability,
-		"video",
-		"sfu",
-	)
+	// The codec is VP8 across all layers and across broadcaster
+	// replacements, so reading from the (possibly old) ls.source is safe.
+	ls.mu.RLock()
+	srcCodec := ls.source.Codec().RTPCodecCapability
+	ls.mu.RUnlock()
+
+	outTrack, err := webrtc.NewTrackLocalStaticRTP(srcCodec, "video", "sfu")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -349,10 +429,32 @@ func (s *SFUServer) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	<-gatherDone
 
-	ls.mu.Lock()
-	ls.viewers = append(ls.viewers, viewer)
-	total := len(ls.viewers)
-	ls.mu.Unlock()
+	// Re-read the layer under the lock and register only if it's still
+	// alive. The layer might have been killed or replaced during setup.
+	s.mu.RLock()
+	currentLs := s.layers[rid]
+	s.mu.RUnlock()
+	if currentLs == nil {
+		_ = pc.Close()
+		http.Error(w, fmt.Sprintf("layer %q no longer available", rid),
+			http.StatusServiceUnavailable)
+		return
+	}
+
+	currentLs.mu.Lock()
+	select {
+	case <-currentLs.done:
+		currentLs.mu.Unlock()
+		_ = pc.Close()
+		http.Error(w, fmt.Sprintf("layer %q died during subscribe", rid),
+			http.StatusServiceUnavailable)
+		return
+	default:
+	}
+	viewer.currentLayer = currentLs
+	currentLs.viewers = append(currentLs.viewers, viewer)
+	total := len(currentLs.viewers)
+	currentLs.mu.Unlock()
 
 	log.Printf("[viewer] registered on %q (layer total: %d)", rid, total)
 
@@ -408,7 +510,14 @@ func (s *SFUServer) requestKeyframe(rid string) error {
 		return fmt.Errorf("layer %q not available", rid)
 	}
 
-	ssrc := uint32(ls.source.SSRC())
+	ls.mu.RLock()
+	src := ls.source
+	ls.mu.RUnlock()
+	if src == nil {
+		return fmt.Errorf("layer %q has no source", rid)
+	}
+
+	ssrc := uint32(src.SSRC())
 	return bc.WriteRTCP([]rtcp.Packet{
 		&rtcp.PictureLossIndication{MediaSSRC: ssrc},
 	})
@@ -491,11 +600,18 @@ func (s *SFUServer) switchLayer(v *viewerConn, newRID string) error {
 
 	v.mu.Lock()
 	v.currentRID = newRID
+	v.currentLayer = newLayer
 	v.lastSwitch = time.Now()
 	v.dropUntilFrameEnd = true
 	v.mu.Unlock()
 
 	newLayer.mu.Lock()
+	select {
+	case <-newLayer.done:
+		newLayer.mu.Unlock()
+		return fmt.Errorf("layer %q died during switch", newRID)
+	default:
+	}
 	newLayer.viewers = append(newLayer.viewers, v)
 	newLayer.mu.Unlock()
 
@@ -522,10 +638,78 @@ func (s *SFUServer) removeViewerFromAllLayers(v *viewerConn) {
 	}
 }
 
+// lifecycleMonitor ticks periodically and kills any layer that has not
+// received a packet within layerInactivityTimeout.
+func (s *SFUServer) lifecycleMonitor() {
+	ticker := time.NewTicker(lifecycleTickInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.checkInactivity()
+	}
+}
+
+func (s *SFUServer) checkInactivity() {
+	now := time.Now().UnixNano()
+	timeout := int64(layerInactivityTimeout)
+
+	s.mu.RLock()
+	var dead []string
+	for rid, ls := range s.layers {
+		last := ls.lastPacket.Load()
+		if last == 0 {
+			continue
+		}
+		if now-last > timeout {
+			dead = append(dead, rid)
+		}
+	}
+	s.mu.RUnlock()
+
+	for _, rid := range dead {
+		s.killLayer(rid)
+	}
+}
+
+// killLayer removes a layer from the map, closes all its viewers' peer
+// connections, and signals its ticker to exit. If this was the last layer,
+// it also closes the broadcaster connection.
+func (s *SFUServer) killLayer(rid string) {
+	s.mu.Lock()
+	ls, ok := s.layers[rid]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.layers, rid)
+	noLayersLeft := len(s.layers) == 0
+	bc := s.broadcaster
+	s.mu.Unlock()
+
+	ls.mu.Lock()
+	viewers := ls.viewers
+	ls.viewers = nil
+	close(ls.done)
+	ls.mu.Unlock()
+
+	for _, v := range viewers {
+		v.mu.Lock()
+		_ = v.pc.Close()
+		v.mu.Unlock()
+	}
+
+	log.Printf("[lifecycle] layer %q killed (%d viewers closed)", rid, len(viewers))
+
+	if noLayersLeft && bc != nil {
+		log.Printf("[lifecycle] no layers left, closing broadcaster connection")
+		_ = bc.Close()
+	}
+}
+
 func (s *SFUServer) handleLayers(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	fmt.Fprintln(w, "rid  measured_bps  viewers")
+	now := time.Now().UnixNano()
+	fmt.Fprintln(w, "rid  measured_bps  viewers  last_pkt")
 	for _, rid := range layerOrder {
 		ls, ok := s.layers[rid]
 		if !ok {
@@ -535,7 +719,14 @@ func (s *SFUServer) handleLayers(w http.ResponseWriter, r *http.Request) {
 		measured := ls.measuredBitrate
 		viewers := len(ls.viewers)
 		ls.mu.RUnlock()
-		fmt.Fprintf(w, "%-4s %-13d %d\n", rid, measured, viewers)
+		last := ls.lastPacket.Load()
+		var age time.Duration
+		if last == 0 {
+			age = -1
+		} else {
+			age = time.Duration(now - last)
+		}
+		fmt.Fprintf(w, "%-4s %-13d %-8d %s\n", rid, measured, viewers, age)
 	}
 }
 
@@ -565,6 +756,55 @@ func (s *SFUServer) handleHLSInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	json.NewEncoder(w).Encode(s.hls.Snapshot())
+}
+
+// handleReset closes the broadcaster connection, all viewer connections,
+// and clears the layer map. Useful for development so you can bring the
+// system back to a clean state without restarting the SFU process.
+func (s *SFUServer) handleReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.mu.Lock()
+	bc := s.broadcaster
+	s.broadcaster = nil
+	layers := s.layers
+	s.layers = make(map[string]*layerState)
+	s.mu.Unlock()
+
+	if bc != nil {
+		_ = bc.Close()
+	}
+
+	totalViewers := 0
+	for rid, ls := range layers {
+		ls.mu.Lock()
+		viewers := ls.viewers
+		ls.viewers = nil
+		close(ls.done)
+		ls.mu.Unlock()
+
+		for _, v := range viewers {
+			v.mu.Lock()
+			_ = v.pc.Close()
+			v.mu.Unlock()
+		}
+		totalViewers += len(viewers)
+		log.Printf("[lifecycle] reset: layer %q closed (%d viewers)", rid, len(viewers))
+	}
+
+	log.Printf("[lifecycle] reset complete: broadcaster=%v layers=%d viewers=%d",
+		bc != nil, len(layers), totalViewers)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"ok":                 true,
+		"broadcasterWasOpen": bc != nil,
+		"layersClosed":       len(layers),
+		"viewersClosed":      totalViewers,
+	})
 }
 
 func newPeerConnection() (*webrtc.PeerConnection, error) {

@@ -60,6 +60,10 @@ built from scratch with Pion and GStreamer.
   watch the stream with a few seconds of extra latency.
 - Serves an **HTML viewer** that attempts WebRTC first, falls back to HLS
   automatically, and lets the user toggle between the two modes manually.
+- **Manages the broadcaster lifecycle** automatically: dead layers are
+  detected after 5 s of silence, viewers on dead layers are closed, and
+  a new broadcaster connection transparently replaces the old one without
+  restarting the SFU process.
 
 The broadcaster is a bridge that reads RTP packets from a GStreamer pipeline
 running on the same machine. The GStreamer pipeline produces three VP8
@@ -112,6 +116,10 @@ The Selective Forwarding Unit. It:
 - Serves HLS content at `/hls/*` from a configurable directory
   (`-hls-dir` flag or `HLS_DIR` environment variable, default `./hls`).
 - Exposes `GET /hls/info` with a JSON snapshot of available variants.
+- Detects broadcaster death via per-layer inactivity timeout (5 s) and
+  cleans up layers and viewers accordingly.
+- Exposes `POST /reset` to force a clean slate without restarting the
+  process.
 
 ### `cmd/broadcaster-gst`
 
@@ -292,11 +300,15 @@ GET /layers
 Example output:
 
 ```
-rid  measured_bps  viewers
-h    500000        1
-m    250000        0
-l    125000        0
+rid  measured_bps  viewers  last_pkt
+h    500000        1        0s
+m    250000        0        0s
+l    125000        0        0s
 ```
+
+The `last_pkt` column shows the time since the last RTP packet was
+received on that layer. Layers that go 5 s without packets are removed
+by the lifecycle monitor.
 
 And the HLS availability with:
 
@@ -445,35 +457,34 @@ Two ways to fix this in the future:
    and each viewer and send a message when the layer changes. More
    complex but no polling.
 
-### Restarting any component requires restarting all
+### Restarting any component still requires restarting all (mostly)
 
-The SFU, the bridge, GStreamer, and the browser each maintain their own
-state:
+The SFU now detects broadcaster death automatically: after 5 s without
+packets on a layer, the layer is killed, its viewers' peer connections
+are closed, and the browser falls back to HLS. A new broadcaster
+connection replaces the old one and migrates viewers transparently.
 
-| Component | State |
-|-----------|-------|
-| GStreamer | Pipeline, three encoders, three SSRCs, sequence counters |
-| Bridge    | WebRTC connection to SFU, three `TrackLocalStaticRTP` |
-| SFU       | `layerState` map, measured bitrates, viewer list |
-| Browser   | `RTCPeerConnection`, decoder buffers, stable SSRC |
+What the SFU still cannot do:
 
-None of these components notifies the others when it restarts. If you
-restart only one, the others will hold stale references to a connection
-that no longer exists, and the system will end up in an inconsistent
-state (missing layers, orphaned viewers, packets written to closed
-sockets).
+- **Revive a bridge or GStreamer pipeline** that died silently. The SFU
+  sees the death (timeout) but cannot force the bridge to reconnect. You
+  still need to restart the bridge and/or GStreamer manually.
+- **Guarantee state consistency across everything.** The bridge and
+  GStreamer each maintain their own state (SSRCs, sequence counters,
+  encoder state). If only one of them is restarted, the SFU will detect
+  the resulting silence and kill the layer, but you'll still want to
+  restart the whole stack to avoid SSRC collisions and stale counters.
 
-**The recommended workflow is:** whenever you restart any component,
-restart all four in this order:
+**The recommended workflow is still:** whenever you restart any
+component, restart all four in this order:
 
-1. SFU
+1. SFU (or use `POST /reset` instead of killing it)
 2. Bridge
 3. GStreamer
 4. Browser viewer
 
-This limitation exists because the demo does not implement lifecycle
-management. See the "Future work" section for the full list of what
-would be needed.
+If you're iterating only on the browser side, `POST /reset` followed by
+a page refresh is enough — no need to touch the terminals.
 
 ### VP8 freeze on large resolution jumps
 
@@ -506,28 +517,12 @@ yet.
 
 ## Future work
 
-### Lifecycle management
+### Broadcaster auto-reconnect
 
-The SFU currently assumes a clean-slate workflow. Production SFUs handle
-component restarts gracefully. Implementing this would require roughly
-100 lines in `cmd/sfu/main.go`:
-
-- **Broadcaster replacement by SSRC.** When a new broadcaster connects
-  with a different SSRC for the same RID, the SFU should recognize it as
-  a replacement. The old layer should be closed, the viewers currently
-  on that layer should be migrated to the new one, and the state
-  cleaned up.
-- **Viewer migration.** When a layer is replaced, every viewer that was
-  on it needs to be moved to the new `layerState`. Without this, the
-  viewers keep writing to a stale `outTrack` and freeze.
-- **Broadcaster inactivity timeout.** If a broadcaster stops sending
-  packets for more than N seconds (say, 5), the SFU should mark the
-  broadcaster as dead, close its layer, and stop accepting new viewers
-  for it. The current implementation has no timeout; a dead broadcaster
-  leaves its layers in the map forever.
-- **Reset endpoint.** Add `POST /reset` that clears all layers, closes
-  the broadcaster connection, and disconnects every viewer. Useful for
-  development to avoid restarting the process.
+The SFU detects a dead broadcaster (5 s inactivity or a failed/closed
+peer connection) and kills its layers, but it cannot force the bridge
+process to reconnect. Adding exponential-backoff reconnect logic inside
+`cmd/broadcaster-gst` would close that gap. Roughly 60 lines.
 
 ### LL-HLS (Low-Latency HLS)
 

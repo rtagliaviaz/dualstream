@@ -60,11 +60,13 @@
     });
   }
 
-  function teardownWebRTC() {
-    clearTimeout(state.timeout); state.timeout = null;
-    if (state.pc) { try { state.pc.close(); } catch (_) {} state.pc = null; }
-    video.srcObject = null;
-  }
+    function teardownWebRTC() {
+      clearTimeout(state.timeout); state.timeout = null;
+      const pc = state.pc;
+      state.pc = null;               // clear BEFORE close, so the state
+      if (pc) { try { pc.close(); } catch (_) {} }   // handler ignores it
+      video.srcObject = null;
+    }
 
   function teardownHLS() {
     if (state.hls) { try { state.hls.destroy(); } catch (_) {} state.hls = null; }
@@ -98,9 +100,13 @@
     };
 
     pc.onconnectionstatechange = () => {
+      if (state.pc !== pc) return;   // stale handler, ignore
       log(`WebRTC estado: ${pc.connectionState}`);
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      if (pc.connectionState === 'failed' ||
+          pc.connectionState === 'disconnected' ||
+          pc.connectionState === 'closed') {
         log('WebRTC caído → fallback a HLS');
+        state.pc = null;             // prevent re-entry
         startHLS();
       }
     };
