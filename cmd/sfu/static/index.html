@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>DualStream — WebRTC + HLS</title>
@@ -17,15 +17,15 @@
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 </head>
 <body>
-  <h1>DualStream <span id="mode-badge">desconectado</span></h1>
-  <div id="status">Iniciando…</div>
+  <h1>DualStream <span id="mode-badge">disconnected</span></h1>
+  <div id="status">Starting…</div>
   <video id="video" autoplay muted playsinline></video>
   <div class="controls">
     <button data-rid="h">High (720p)</button>
     <button data-rid="m">Medium (480p)</button>
     <button data-rid="l">Low (360p)</button>
-    <button id="toggle-mode">Cambiar a HLS</button>
+    <button id="toggle-mode">Switch to HLS</button>
   </div>
-  <script src="player.js?v=3"></script>
+  <script src="player.js?v=4"></script>
 </body>
 </html>

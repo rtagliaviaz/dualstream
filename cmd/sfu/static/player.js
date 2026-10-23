@@ -39,18 +39,18 @@
   function findToggleButton() {
     const byId = document.getElementById('toggle-mode');
     if (byId) return byId;
-    return btns.find(b => b.textContent.trim().toLowerCase().startsWith('cambiar')) || null;
+    return btns.find(b => b.textContent.trim().toLowerCase().startsWith('switch')) || null;
   }
 
   function updateModeButton() {
     const btn = findToggleButton();
     if (!btn) return;
     if (state.mode === 'hls') {
-      btn.textContent = 'Cambiar a WebRTC';
+      btn.textContent = 'Switch to WebRTC';
     } else if (state.mode === 'webrtc') {
-      btn.textContent = 'Cambiar a HLS';
+      btn.textContent = 'Switch to HLS';
     } else {
-      btn.textContent = 'Conectando…';
+      btn.textContent = 'Connecting…';
     }
   }
 
@@ -60,13 +60,13 @@
     });
   }
 
-    function teardownWebRTC() {
-      clearTimeout(state.timeout); state.timeout = null;
-      const pc = state.pc;
-      state.pc = null;               // clear BEFORE close, so the state
-      if (pc) { try { pc.close(); } catch (_) {} }   // handler ignores it
-      video.srcObject = null;
-    }
+  function teardownWebRTC() {
+    clearTimeout(state.timeout); state.timeout = null;
+    const pc = state.pc;
+    state.pc = null;               // clear BEFORE close, so the state
+    if (pc) { try { pc.close(); } catch (_) {} }   // handler ignores it
+    video.srcObject = null;
+  }
 
   function teardownHLS() {
     if (state.hls) { try { state.hls.destroy(); } catch (_) {} state.hls = null; }
@@ -79,9 +79,9 @@
     teardownWebRTC();
     teardownHLS();
     state.mode = 'connecting';
-    setBadge('conectando webrtc');
+    setBadge('connecting webrtc');
     updateModeButton();
-    log(`WebRTC: pidiendo capa ${rid}…`);
+    log(`WebRTC: requesting layer ${rid}…`);
 
     const pc = new RTCPeerConnection({
       iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
@@ -91,7 +91,7 @@
 
     pc.ontrack = (ev) => {
       clearTimeout(state.timeout); state.timeout = null;
-      log(`WebRTC: reproduciendo (${rid})`);
+      log(`WebRTC: playing (${rid})`);
       state.mode = 'webrtc';
       setBadge('webrtc');
       updateModeButton();
@@ -101,11 +101,11 @@
 
     pc.onconnectionstatechange = () => {
       if (state.pc !== pc) return;   // stale handler, ignore
-      log(`WebRTC estado: ${pc.connectionState}`);
+      log(`WebRTC state: ${pc.connectionState}`);
       if (pc.connectionState === 'failed' ||
           pc.connectionState === 'disconnected' ||
           pc.connectionState === 'closed') {
-        log('WebRTC caído → fallback a HLS');
+        log('WebRTC down → falling back to HLS');
         state.pc = null;             // prevent re-entry
         startHLS();
       }
@@ -113,7 +113,7 @@
 
     state.timeout = setTimeout(() => {
       if (state.pc === pc && !pc.getReceivers().some(r => r.track)) {
-        log('WebRTC timeout → fallback a HLS');
+        log('WebRTC timeout → falling back to HLS');
         startHLS();
       }
     }, WEBRTC_TIMEOUT_MS);
@@ -146,7 +146,7 @@
 
     const answer = await res.json();
     await pc.setRemoteDescription(answer);
-    log('WebRTC: SDP negociado');
+    log('WebRTC: SDP negotiated');
   }
 
   // ---- HLS --------------------------------------------------------
@@ -154,11 +154,11 @@
     try {
       const info = await (await fetch('/hls/info')).json();
       if (!info.available) {
-        log('HLS no disponible todavía — no se cambia de modo');
+        log('HLS not available yet — not switching mode');
         return;
       }
     } catch (e) {
-      log(`No se pudo consultar /hls/info: ${e.message}`);
+      log(`Could not query /hls/info: ${e.message}`);
       return;
     }
 
@@ -170,7 +170,7 @@
     updateModeButton();
 
     const url = '/hls/master.m3u8';
-    log('HLS: cargando master playlist…');
+    log('HLS: loading master playlist…');
 
     if (window.Hls && Hls.isSupported()) {
       const hls = new Hls({ enableWorker: true });
@@ -179,23 +179,23 @@
       hls.attachMedia(video);
 
       hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-        log(`HLS: ${data.levels.length} variante(s) — reproduciendo`);
+        log(`HLS: ${data.levels.length} variant(s) — playing`);
         video.play().catch(err => log(`play() failed: ${err.message}`));
       });
       hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
         const lvl = hls.levels[data.level];
-        log(`HLS: ABR eligió ${lvl.width}x${lvl.height} @ ${Math.round(lvl.bitrate/1000)} kbps`);
+        log(`HLS: ABR picked ${lvl.width}x${lvl.height} @ ${Math.round(lvl.bitrate/1000)} kbps`);
       });
       hls.on(Hls.Events.ERROR, (_, data) => {
-        if (data.fatal) { log(`HLS error fatal (${data.type})`); teardownHLS(); }
+        if (data.fatal) { log(`HLS fatal error (${data.type})`); teardownHLS(); }
         else { console.warn('[hls]', data); }
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = url;
       video.play().catch(err => log(`play() failed: ${err.message}`));
-      log('HLS: reproducción nativa');
+      log('HLS: native playback');
     } else {
-      log('HLS no soportado por este navegador');
+      log('HLS not supported by this browser');
     }
   }
 
@@ -204,13 +204,13 @@
     state.rid = rid;
     highlightRID(rid);
     if (state.mode === 'hls' && !force) {
-      log('En modo HLS el ABR gestiona la calidad automáticamente');
+      log('In HLS mode the ABR manages quality automatically');
       return;
     }
     try {
       await startWebRTC(rid);
     } catch (e) {
-      log(`WebRTC falló: ${e.message} → fallback a HLS`);
+      log(`WebRTC failed: ${e.message} → falling back to HLS`);
       await startHLS();
     }
   }
@@ -224,9 +224,9 @@
       id: btn.id, rid: btn.dataset.rid, text: btn.textContent.trim()
     }));
 
-    // Toggle: id="toggle-mode" or text starting with "cambiar"
+    // Toggle: id="toggle-mode" or text starting with "switch"
     const isToggle = btn.id === 'toggle-mode' ||
-      (!btn.dataset.rid && btn.textContent.trim().toLowerCase().startsWith('cambiar'));
+      (!btn.dataset.rid && btn.textContent.trim().toLowerCase().startsWith('switch'));
 
     if (isToggle) {
       e.preventDefault();
@@ -246,7 +246,7 @@
   updateModeButton();
 
   switchTo(state.rid).catch(e => {
-    log(`Arranque WebRTC falló: ${e.message} → HLS`);
+    log(`Initial WebRTC failed: ${e.message} → HLS`);
     startHLS();
   });
 })();
