@@ -31,19 +31,19 @@ built from scratch with Pion and GStreamer.
   - [Configuration](#configuration)
   - [Latency](#latency)
   - [Storage hygiene](#storage-hygiene)
+- [Audio](#audio)
 - [What happens under the hood during a switch](#what-happens-under-the-hood-during-a-switch)
 - [Limitations](#limitations)
   - [UI layer detection requires distinct resolutions](#ui-layer-detection-requires-distinct-resolutions)
-  - [Restarting any component requires restarting all](#restarting-any-component-requires-restarting-all)
+  - [Restarting any component still requires restarting all (mostly)](#restarting-any-component-still-requires-restarting-all-mostly)
   - [VP8 freeze on large resolution jumps](#vp8-freeze-on-large-resolution-jumps)
   - [HLS requires a shared directory](#hls-requires-a-shared-directory)
 - [Future work](#future-work)
-  - [Lifecycle management](#lifecycle-management)
+  - [Broadcaster auto-reconnect](#broadcaster-auto-reconnect)
   - [LL-HLS (Low-Latency HLS)](#ll-hls-low-latency-hls)
   - [HLS ingestion endpoint](#hls-ingestion-endpoint)
   - [Metrics and observability](#metrics-and-observability)
   - [`SetParameters`-based layer switching](#setparameters-based-layer-switching)
-  - [Audio](#audio)
 - [License](#license)
 
 ## What it does
@@ -58,6 +58,8 @@ built from scratch with Pion and GStreamer.
 - Serves an **HLS fallback** from the same source, so clients that cannot
   use WebRTC (legacy browsers, HTTP-only networks, smart TVs) can still
   watch the stream with a few seconds of extra latency.
+- Streams **audio alongside video** in both transports: one `Opus` track
+  over WebRTC, and `AAC` muxed into every HLS segment.
 - Serves an **HTML viewer** that attempts WebRTC first, falls back to HLS
   automatically, and lets the user toggle between the two modes manually.
 - **Manages the broadcaster lifecycle** automatically: dead layers are
@@ -67,40 +69,45 @@ built from scratch with Pion and GStreamer.
 
 The broadcaster is a bridge that reads RTP packets from a GStreamer pipeline
 running on the same machine. The GStreamer pipeline produces three VP8
-encodings (WebRTC) and three H.264/MPEG-TS segmentations (HLS) of the same
-source at different resolutions and bitrates, and sends the RTP layers to
-the bridge over UDP while writing the HLS segments to a shared directory.
+encodings plus one Opus encoding for WebRTC, and three H.264/AAC MPEG-TS
+segmentations for HLS, all sourced from the same video and audio inputs.
+The bridge forwards the RTP layers to the SFU over UDP, while `hlssink`
+writes the HLS segments to a shared directory.
 
 ## Architecture
 
 ```
-    GStreamer                        Bridge (Go)             SFU (Go)           Viewers
-    ─────────                        ───────────             ────────           ───────
+    GStreamer                          Bridge (Go)            SFU (Go)         Viewers
+    ─────────                          ───────────            ────────         ───────
 
     videotestsrc
          │
          ├── h: 1280x720 ──VP8/RTP──► :5000 ─┐
          ├── m:  854x480 ──VP8/RTP──► :5001 ─┼──► WebRTC ──► demux by RID
-         └── l:  640x360 ──VP8/RTP──► :5002 ─┘                   │
-                                                                 │
-                                                  ┌──────────────┼──────────────┐
-                                                  ▼              ▼              ▼
-                                              Viewer 1       Viewer 2       Viewer 3
-                                              layer h        layer m        layer l
+         ├── l:  640x360 ──VP8/RTP──► :5002 ─┘                 │
+         │                                                     │
+    audiotestsrc ──────Opus/RTP────► :5004 ────────────────────┤
+                                                               │
+                                              ┌────────────────┼────────────────┐
+                                              ▼                ▼                ▼
+                                          Viewer 1         Viewer 2         Viewer 3
+                                          layer h          layer m          layer l
+                                          + audio          + audio          + audio
 
-         └── 720p/480p/360p ──H.264/TS──► ./hls/  ──►  GET /hls/*  ──►  hls.js
-
+         └── 720p/480p/360p ──H.264/AAC/TS──► ./hls/ ──► GET /hls/* ──► hls.js
 ```
 
-The bridge attaches the RID and MID header extensions to each RTP packet
-so the SFU can demux the three layers. Every viewer gets a single
-`RTPSender` whose SSRC and sequence numbers are stable across layer
-switches, so the browser sees one continuous stream even when the
-underlying layer changes.
+The bridge attaches the RID and MID header extensions to each video RTP
+packet, and only MID to each audio packet. Every viewer gets a single
+video `RTPSender` whose SSRC and sequence numbers are stable across
+layer switches, so the browser sees one continuous stream even when the
+underlying layer changes. Audio uses a second, independent sender that
+is never switched.
 
 The HLS side is independent: `hlssink` rotates segments in `./hls/`, the
 SFU serves them over `/hls/`, and the browser uses `hls.js` when WebRTC
-is not available.
+is not available. Every HLS segment carries both H.264 video and AAC
+audio, so the same `.ts` file is a complete A/V fragment.
 
 ## Components
 
@@ -108,10 +115,13 @@ is not available.
 
 The Selective Forwarding Unit. It:
 
-- Accepts a broadcaster via `POST /broadcast` (SDP offer → answer).
-- Accepts viewers via `POST /subscribe?rid=h|m|l`.
-- Measures the actual bitrate of each layer once per second.
-- Reads REMB feedback from each viewer and decides whether to switch layers.
+- Accepts a broadcaster via `POST /broadcast` (SDP offer → answer), with
+  both a video m-line (three simulcast layers) and an audio m-line.
+- Accepts viewers via `POST /subscribe?rid=h|m|l`. Each viewer gets one
+  video layer plus the audio track, if the client offered one.
+- Measures the actual bitrate of each video layer once per second.
+- Reads REMB feedback from each viewer and decides whether to switch
+  video layers. Audio is not switched.
 - Serves the HTML viewer at `/`.
 - Serves HLS content at `/hls/*` from a configurable directory
   (`-hls-dir` flag or `HLS_DIR` environment variable, default `./hls`).
@@ -125,10 +135,20 @@ The Selective Forwarding Unit. It:
 
 A bridge that sits between GStreamer and the SFU. It:
 
-- Listens on UDP ports `5000`, `5001`, `5002` for RTP packets.
-- Rewrites the RTP header extensions (MID, RID) on each packet.
-- Writes the packets into three `TrackLocalStaticRTP` tracks.
-- Publishes all three tracks to the SFU over a single WebRTC connection.
+- Listens on UDP ports `5000`, `5001`, `5002` for video RTP, and on
+  `5004` for audio RTP.
+- Rewrites the RTP header extensions on each packet: MID + RID for
+  video, MID only for audio.
+- Writes the packets into three video `TrackLocalStaticRTP` tracks and
+  one audio `TrackLocalStaticRTP` track.
+- Publishes all four tracks to the SFU over a single WebRTC connection
+  with two transceivers (video simulcast + audio).
+- Runs a reconnect loop with exponential backoff, so a server-side close
+  (from `POST /reset`, an inactivity timeout, or an SFU restart) is
+  recovered in ~1–2 s without manual intervention. The UDP listeners
+  and the tracks are created once and reused across reconnects; only
+  the `PeerConnection`, its transceivers, and the `POST /broadcast`
+  call are repeated.
 
 ### `cmd/viewer`
 
@@ -157,7 +177,10 @@ The HLS server package. It:
 - **Go 1.25+**
 - **GStreamer 1.22+** with the following plugins: `videotestsrc`,
   `vp8enc`, `rtpvp8pay`, `udpsink`, `x264enc`, `h264parse`, `mpegtsmux`,
-  `hlssink`. On Linux these come from `gstreamer1.0-plugins-{base,good,bad,ugly}`.
+  `hlssink`, `audiotestsrc`, `opusenc`, `rtpopuspay`, `audioconvert`,
+  `audioresample`, `aacparse`, plus an AAC encoder (`avenc_aac` from
+  `gst-libav`, or `voaacenc` from `gst-plugins-bad`). On Linux these come
+  from `gstreamer1.0-plugins-{base,good,bad,ugly}` and `gstreamer1.0-libav`.
   On Windows, install the *runtime* and *development* `.msi` packages from
   [gstreamer.freedesktop.org](https://gstreamer.freedesktop.org/download/#windows).
 - **A modern browser** (Chrome, Edge, Firefox, Safari) with `hls.js`
@@ -228,22 +251,34 @@ Open `http://localhost:8080/`.
 ### Manual GStreamer pipeline
 
 If you prefer to run GStreamer directly without the wrapper script, this
-is the full pipeline the scripts produce:
+is the full pipeline the scripts produce. The video and audio trees run
+in parallel; the AAC encoder is chosen by the script (`avenc_aac` if
+present, `voaacenc` otherwise) — the example below uses `avenc_aac`.
 
 ```bash
 gst-launch-1.0 -e \
+  audiotestsrc is-live=true wave=sine freq=440 volume=0.15 ! \
+  audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 ! \
+  tee name=asrc \
+  asrc. ! queue ! opusenc bitrate=64000 ! rtpopuspay pt=111 ! \
+      udpsink host=127.0.0.1 port=5004 \
+  asrc. ! queue ! audioconvert ! avenc_aac bitrate=128000 ! aacparse ! \
+      tee name=aac \
   videotestsrc is-live=true pattern=ball ! \
   video/x-raw,width=1280,height=720,framerate=30/1 ! \
   tee name=t \
   t. ! queue ! vp8enc deadline=1 cpu-used=4 ! rtpvp8pay pt=96 ! udpsink host=127.0.0.1 port=5000 \
   t. ! queue ! videoscale ! video/x-raw,width=854,height=480 ! vp8enc deadline=1 cpu-used=4 ! rtpvp8pay pt=96 ! udpsink host=127.0.0.1 port=5001 \
   t. ! queue ! videoscale ! video/x-raw,width=640,height=360 ! vp8enc deadline=1 cpu-used=4 ! rtpvp8pay pt=96 ! udpsink host=127.0.0.1 port=5002 \
-  t. ! queue ! x264enc tune=zerolatency bitrate=2000 key-int-max=30 speed-preset=ultrafast ! h264parse ! mpegtsmux ! \
-      hlssink target-duration=4 playlist-length=6 max-files=12 location=./hls/720p/segment_%05d.ts playlist-location=./hls/720p/playlist.m3u8 \
-  t. ! queue ! videoscale ! video/x-raw,width=854,height=480 ! x264enc tune=zerolatency bitrate=800 key-int-max=30 speed-preset=ultrafast ! h264parse ! mpegtsmux ! \
-      hlssink target-duration=4 playlist-length=6 max-files=12 location=./hls/480p/segment_%05d.ts playlist-location=./hls/480p/playlist.m3u8 \
-  t. ! queue ! videoscale ! video/x-raw,width=640,height=360 ! x264enc tune=zerolatency bitrate=400 key-int-max=30 speed-preset=ultrafast ! h264parse ! mpegtsmux ! \
-      hlssink target-duration=4 playlist-length=6 max-files=12 location=./hls/360p/segment_%05d.ts playlist-location=./hls/360p/playlist.m3u8
+  t. ! queue ! x264enc tune=zerolatency bitrate=2000 key-int-max=30 speed-preset=ultrafast ! h264parse ! mpegtsmux name=mux720 \
+  aac. ! queue ! mux720. \
+  mux720. ! hlssink target-duration=4 playlist-length=6 max-files=12 location=./hls/720p/segment_%05d.ts playlist-location=./hls/720p/playlist.m3u8 \
+  t. ! queue ! videoscale ! video/x-raw,width=854,height=480 ! x264enc tune=zerolatency bitrate=800 key-int-max=30 speed-preset=ultrafast ! h264parse ! mpegtsmux name=mux480 \
+  aac. ! queue ! mux480. \
+  mux480. ! hlssink target-duration=4 playlist-length=6 max-files=12 location=./hls/480p/segment_%05d.ts playlist-location=./hls/480p/playlist.m3u8 \
+  t. ! queue ! videoscale ! video/x-raw,width=640,height=360 ! x264enc tune=zerolatency bitrate=400 key-int-max=30 speed-preset=ultrafast ! h264parse ! mpegtsmux name=mux360 \
+  aac. ! queue ! mux360. \
+  mux360. ! hlssink target-duration=4 playlist-length=6 max-files=12 location=./hls/360p/segment_%05d.ts playlist-location=./hls/360p/playlist.m3u8
 ```
 
 Note the `-e` flag: it ensures `hlssink` receives an EOS on `Ctrl+C`
@@ -401,6 +436,49 @@ always respected from a clean slate. If you run GStreamer manually, do
 the same cleanup yourself, or expect the number of `.ts` files to grow
 across runs.
 
+## Audio
+
+Audio is a single source, not simulcast. Real streaming platforms do not
+switch audio bitrate per viewer — Opus is small enough (64 kbps) that a
+single quality is fine, and switching audio mid-stream would cause
+audible glitches without any bandwidth benefit.
+
+### WebRTC path
+
+The bridge listens on UDP `:5004` for Opus RTP, adds the MID header
+extension (no RID, since there is only one audio stream), and writes
+into a single `TrackLocalStaticRTP` that is added to the broadcaster's
+`PeerConnection` as its own transceiver.
+
+On the SFU side, `handleBroadcast` sees the audio track in `OnTrack`,
+stores it in `s.audio`, and spawns `forwardAudio`, which reads from the
+audio source and writes to every viewer's `audioTrack`. The SFU does
+**not** rewrite SSRC, sequence number, or timestamp on audio: there is
+only one source, so all viewers can share the same stream as-is.
+
+`handleSubscribe` adds an audio track only if the client's SDP offer
+contains an `m=audio` line. Without that check, the SFU's answer would
+have more m-lines than the offer, and strict clients would reject it.
+If the broadcaster has not yet published audio, the viewer's audio
+transceiver starts silent and begins producing sound as soon as packets
+arrive — no renegotiation needed.
+
+### HLS path
+
+The same `audiotestsrc` feeds an AAC encoder (`avenc_aac` or `voaacenc`,
+selected by the pipeline script). The AAC stream is fanned out with a
+`tee` to three named `mpegtsmux` elements, one per video variant. Every
+`.ts` file that `hlssink` writes therefore contains both H.264 video
+and AAC audio, and `hls.js` plays them together as a single media
+stream.
+
+### Unmuting
+
+Browsers require muted autoplay by default. `player.js` unmutes the
+`<video>` element on the first user click, so the audio is audible
+without breaking autoplay. If you never click on the page, audio stays
+muted — this is expected browser behavior, not a bug.
+
 ## What happens under the hood during a switch
 
 The naive way to switch layers is `RTPSender.ReplaceTrack()`. It does not
@@ -517,13 +595,6 @@ yet.
 
 ## Future work
 
-### Broadcaster auto-reconnect
-
-The SFU detects a dead broadcaster (5 s inactivity or a failed/closed
-peer connection) and kills its layers, but it cannot force the bridge
-process to reconnect. Adding exponential-backoff reconnect logic inside
-`cmd/broadcaster-gst` would close that gap. Roughly 60 lines.
-
 ### LL-HLS (Low-Latency HLS)
 
 Reduce the HLS latency from ~8 s to ~2 s using partial segments
@@ -550,12 +621,6 @@ only at the server and displays a subset in the viewer.
 Replace the current single-track approach with three persistent tracks
 per viewer, toggled via `RTPSender.SetParameters`. This eliminates the
 VP8 freeze entirely and is how production SFUs do it.
-
-### Audio
-
-The demo is video-only. Adding an Opus track to the WebRTC side and an
-AAC track to the HLS side is the next logical step for a usable
-streaming platform.
 
 ## License
 

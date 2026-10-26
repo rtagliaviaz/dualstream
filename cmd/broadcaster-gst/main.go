@@ -23,17 +23,18 @@ const (
 	maxBackoff     = 10 * time.Second
 )
 
-// extIDs holds the negotiated extension IDs and MID for the current
-// PeerConnection. Stored atomically and read by the forever-running UDP
-// forwarders on every packet. When nil, forwarders drop packets.
+// extIDs holds the negotiated extension IDs and the MIDs for both
+// transceivers of the current PC. Stored atomically and read by the
+// forever-running UDP forwarders.
 type extIDs struct {
 	midID, ridID uint8
-	mid          string
+	videoMid     string
+	audioMid     string
 }
 
 type udpLayer struct {
 	port  int
-	rid   string
+	rid   string // "h"/"m"/"l" for video, "" for audio
 	track *webrtc.TrackLocalStaticRTP
 }
 
@@ -43,36 +44,45 @@ func main() {
 		log.Fatalf("webrtc api: %v", err)
 	}
 
-	// Tracks are created once and reused across reconnects. A
-	// TrackLocalStaticRTP can bind to a fresh RTPSender on each new PC.
-	capability := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}
-	mustTrack := func(rid string) *webrtc.TrackLocalStaticRTP {
-		t, err := webrtc.NewTrackLocalStaticRTP(capability, "video", "broadcaster",
+	videoCodec := webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8}
+	audioCodec := webrtc.RTPCodecCapability{
+		MimeType:  webrtc.MimeTypeOpus,
+		ClockRate: 48000,
+		Channels:  2,
+	}
+
+	mustVideoTrack := func(rid string) *webrtc.TrackLocalStaticRTP {
+		t, err := webrtc.NewTrackLocalStaticRTP(videoCodec, "video", "broadcaster",
 			webrtc.WithRTPStreamID(rid))
 		if err != nil {
 			log.Fatalf("track %s: %v", rid, err)
 		}
 		return t
 	}
-
-	layers := []udpLayer{
-		{port: 5000, rid: "h", track: mustTrack("h")},
-		{port: 5001, rid: "m", track: mustTrack("m")},
-		{port: 5002, rid: "l", track: mustTrack("l")},
+	mustAudioTrack := func() *webrtc.TrackLocalStaticRTP {
+		t, err := webrtc.NewTrackLocalStaticRTP(audioCodec, "audio", "broadcaster")
+		if err != nil {
+			log.Fatalf("audio track: %v", err)
+		}
+		return t
 	}
 
-	// UDP forwarders run forever. They write into the shared tracks;
-	// whether a PC is consuming them depends on the active sender.
+	layers := []udpLayer{
+		{port: 5000, rid: "h", track: mustVideoTrack("h")},
+		{port: 5001, rid: "m", track: mustVideoTrack("m")},
+		{port: 5002, rid: "l", track: mustVideoTrack("l")},
+		{port: 5004, rid: "", track: mustAudioTrack()},
+	}
+
 	var currentExt atomic.Pointer[extIDs]
 	for _, l := range layers {
 		l := l
-		go listenAndForward(l.port, l.rid, l.track, &currentExt)
+		go listenAndForward(l, &currentExt)
 	}
 
-	// ---- Reconnect loop ----------------------------------------------
 	backoff := initialBackoff
 	for {
-		pc, sender, tr, err := connectAndPublish(api, layers)
+		pc, senders, err := connectAndPublish(api, layers)
 		if err != nil {
 			log.Printf("bridge: connect failed: %v (retry in %s)", err, backoff)
 			time.Sleep(backoff)
@@ -83,15 +93,15 @@ func main() {
 		}
 		backoff = initialBackoff
 
-		ext, err := discoverExtensions(sender, tr)
+		ext, err := discoverExtensions(pc, senders)
 		if err != nil {
 			log.Printf("bridge: extension discovery failed: %v", err)
 			_ = pc.Close()
 			continue
 		}
 		currentExt.Store(ext)
-		log.Printf("bridge: connected (MID=%d RID=%d mid=%q)",
-			ext.midID, ext.ridID, ext.mid)
+		log.Printf("bridge: connected (MID=%d RID=%d videoMid=%q audioMid=%q)",
+			ext.midID, ext.ridID, ext.videoMid, ext.audioMid)
 
 		waitForClose(pc)
 		log.Printf("bridge: PC closed, reconnecting…")
@@ -118,18 +128,21 @@ func newAPI() (*webrtc.API, error) {
 	), nil
 }
 
-// connectAndPublish creates a fresh PC, wires the three tracks into a
-// single simulcast transceiver, negotiates with the SFU, and blocks
-// until the PC is connected (or fails).
+// connectAndPublish builds a fresh PC with two transceivers (video
+// simulcast + audio), negotiates with the SFU, and waits for ICE.
 func connectAndPublish(api *webrtc.API, layers []udpLayer) (
-	*webrtc.PeerConnection, *webrtc.RTPSender, *webrtc.RTPTransceiver, error,
+	*webrtc.PeerConnection, []*webrtc.RTPSender, error,
 ) {
 	pc, err := api.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	transceiver, err := pc.AddTransceiverFromTrack(layers[0].track,
+	videoTrack := layers[0].track
+	audioTrack := layers[3].track
+
+	// Video transceiver with three simulcast encodings.
+	videoTr, err := pc.AddTransceiverFromTrack(videoTrack,
 		webrtc.RTPTransceiverInit{
 			Direction: webrtc.RTPTransceiverDirectionSendonly,
 			SendEncodings: []webrtc.RTPEncodingParameters{
@@ -141,36 +154,49 @@ func connectAndPublish(api *webrtc.API, layers []udpLayer) (
 	)
 	if err != nil {
 		_ = pc.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
+	}
+	videoSender := videoTr.Sender()
+	if err := videoSender.AddEncoding(layers[1].track); err != nil {
+		_ = pc.Close()
+		return nil, nil, err
+	}
+	if err := videoSender.AddEncoding(layers[2].track); err != nil {
+		_ = pc.Close()
+		return nil, nil, err
 	}
 
-	sender := transceiver.Sender()
-	for _, l := range layers[1:] {
-		if err := sender.AddEncoding(l.track); err != nil {
-			_ = pc.Close()
-			return nil, nil, nil, err
-		}
+	// Audio transceiver (single track, no simulcast).
+	audioTr, err := pc.AddTransceiverFromTrack(audioTrack,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionSendonly},
+	)
+	if err != nil {
+		_ = pc.Close()
+		return nil, nil, err
 	}
+	audioSender := audioTr.Sender()
 
-	// Drain RTCP on this sender so Pion doesn't block on the receive path.
-	go func() {
-		buf := make([]byte, 1500)
-		for {
-			if _, _, err := sender.Read(buf); err != nil {
-				return
+	// Drain RTCP from both senders.
+	for _, s := range []*webrtc.RTPSender{videoSender, audioSender} {
+		go func(s *webrtc.RTPSender) {
+			buf := make([]byte, 1500)
+			for {
+				if _, _, err := s.Read(buf); err != nil {
+					return
+				}
 			}
-		}
-	}()
+		}(s)
+	}
 
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
 		_ = pc.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	gatherDone := webrtc.GatheringCompletePromise(pc)
 	if err := pc.SetLocalDescription(offer); err != nil {
 		_ = pc.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	<-gatherDone
 
@@ -178,33 +204,34 @@ func connectAndPublish(api *webrtc.API, layers []udpLayer) (
 	answer, err := postSDP(sfuURL+"/broadcast", pc.LocalDescription())
 	if err != nil {
 		_ = pc.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	if err := pc.SetRemoteDescription(*answer); err != nil {
 		_ = pc.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	// Wait for ICE to complete, with a cap so a dead SFU doesn't stall
-	// the reconnect loop forever.
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		switch pc.ConnectionState() {
 		case webrtc.PeerConnectionStateConnected:
-			return pc, sender, transceiver, nil
+			return pc, []*webrtc.RTPSender{videoSender, audioSender}, nil
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed:
 			_ = pc.Close()
-			return nil, nil, nil, fmt.Errorf("PC reached terminal state during connect")
+			return nil, nil, fmt.Errorf("PC reached terminal state during connect")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	_ = pc.Close()
-	return nil, nil, nil, fmt.Errorf("timeout waiting for PC to connect")
+	return nil, nil, fmt.Errorf("timeout waiting for PC to connect")
 }
 
-func discoverExtensions(sender *webrtc.RTPSender, tr *webrtc.RTPTransceiver) (*extIDs, error) {
-	params := sender.GetParameters()
+func discoverExtensions(
+	pc *webrtc.PeerConnection,
+	senders []*webrtc.RTPSender,
+) (*extIDs, error) {
+	params := senders[0].GetParameters() // video sender
 	var e extIDs
 	for _, ext := range params.HeaderExtensions {
 		switch ext.URI {
@@ -218,60 +245,75 @@ func discoverExtensions(sender *webrtc.RTPSender, tr *webrtc.RTPTransceiver) (*e
 		return nil, fmt.Errorf("MID or RID extension not negotiated (mid=%d rid=%d)",
 			e.midID, e.ridID)
 	}
-	e.mid = tr.Mid()
+	for _, t := range pc.GetTransceivers() {
+		if t.Mid() == "" {
+			continue
+		}
+		sender := t.Sender()
+		if sender == nil {
+			continue
+		}
+		track := sender.Track()
+		if track == nil {
+			continue
+		}
+		switch track.Kind() {
+		case webrtc.RTPCodecTypeVideo:
+			e.videoMid = t.Mid()
+		case webrtc.RTPCodecTypeAudio:
+			e.audioMid = t.Mid()
+		}
+	}
+	if e.videoMid == "" || e.audioMid == "" {
+		return nil, fmt.Errorf("MID not resolved (video=%q audio=%q)",
+			e.videoMid, e.audioMid)
+	}
 	return &e, nil
 }
 
-// listenAndForward receives RTP packets from GStreamer and forwards them
-// into the shared track. Timestamps and sequence numbers are PRESERVED as
-// GStreamer set them; only MID and RID header extensions are added so the
-// SFU can demux layers. When there is no active PC, packets are dropped.
-func listenAndForward(
-	port int,
-	rid string,
-	track *webrtc.TrackLocalStaticRTP,
-	ext *atomic.Pointer[extIDs],
-) {
-	addr := fmt.Sprintf(":%d", port)
+// listenAndForward reads RTP from a UDP port and writes it to the track.
+// Video packets get MID+RID extensions; audio packets only get MID.
+func listenAndForward(l udpLayer, ext *atomic.Pointer[extIDs]) {
+	addr := fmt.Sprintf(":%d", l.port)
 	conn, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		log.Fatalf("cannot listen on %s: %v", addr, err)
 	}
 	defer conn.Close()
-	log.Printf("[%s] listening on %s", rid, addr)
+	label := l.rid
+	if label == "" {
+		label = "audio"
+	}
+	log.Printf("[%s] listening on %s", label, addr)
 
 	buf := make([]byte, 1500)
 	for {
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
-			log.Printf("[%s] read error: %v", rid, err)
+			log.Printf("[%s] read error: %v", label, err)
 			continue
 		}
-
 		e := ext.Load()
 		if e == nil {
-			// No active PC; drop. Normal during a reconnect window.
 			continue
 		}
-
 		pkt := &rtp.Packet{}
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
-			log.Printf("[%s] invalid RTP packet: %v", rid, err)
+			log.Printf("[%s] invalid RTP packet: %v", label, err)
 			continue
 		}
-
-		_ = pkt.Header.SetExtension(e.midID, []byte(e.mid))
-		_ = pkt.Header.SetExtension(e.ridID, []byte(rid))
-
-		if err := track.WriteRTP(pkt); err != nil {
-			// Track has no active sender right now; drop.
+		if l.rid == "" {
+			_ = pkt.Header.SetExtension(e.midID, []byte(e.audioMid))
+		} else {
+			_ = pkt.Header.SetExtension(e.midID, []byte(e.videoMid))
+			_ = pkt.Header.SetExtension(e.ridID, []byte(l.rid))
+		}
+		if err := l.track.WriteRTP(pkt); err != nil {
 			continue
 		}
 	}
 }
 
-// waitForClose blocks until the PC enters a terminal state. It checks
-// the current state first, so a PC that already failed doesn't hang.
 func waitForClose(pc *webrtc.PeerConnection) {
 	done := make(chan struct{}, 1)
 	pc.OnConnectionStateChange(func(s webrtc.PeerConnectionState) {

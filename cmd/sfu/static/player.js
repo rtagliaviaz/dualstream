@@ -88,14 +88,28 @@
     });
     state.pc = pc;
     pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
 
     pc.ontrack = (ev) => {
       clearTimeout(state.timeout); state.timeout = null;
-      log(`WebRTC: playing (${rid})`);
-      state.mode = 'webrtc';
-      setBadge('webrtc');
-      updateModeButton();
-      video.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+      const kind = ev.track.kind;
+      log(`WebRTC: received ${kind} track (${rid})`);
+
+      if (ev.streams && ev.streams.length > 0) {
+        video.srcObject = ev.streams[0];
+      } else {
+        if (!video.srcObject) video.srcObject = new MediaStream();
+        video.srcObject.addTrack(ev.track);
+      }
+
+      // Once the video track arrives, consider the mode switch complete.
+      // If audio arrives later, it just adds to the same MediaStream.
+      if (kind === 'video' && state.mode !== 'webrtc') {
+        state.mode = 'webrtc';
+        setBadge('webrtc');
+        updateModeButton();
+        log(`WebRTC: playing (${rid})`);
+      }
       video.play().catch(err => log(`play() failed: ${err.message}`));
     };
 
@@ -248,5 +262,12 @@
   switchTo(state.rid).catch(e => {
     log(`Initial WebRTC failed: ${e.message} → HLS`);
     startHLS();
+  });
+
+  document.addEventListener('click', () => {
+    if (video.muted) {
+      video.muted = false;
+      log('Audio unmuted');
+    }
   });
 })();

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,12 +33,23 @@ const (
 	lifecycleTickInterval  = 2 * time.Second
 )
 
+var opusCapability = webrtc.RTPCodecCapability{
+	MimeType:  webrtc.MimeTypeOpus,
+	ClockRate: 48000,
+	Channels:  2,
+}
+
+type audioState struct {
+	source *webrtc.TrackRemote
+}
+
 type SFUServer struct {
 	mu           sync.RWMutex
 	broadcaster  *webrtc.PeerConnection
 	layers       map[string]*layerState
 	debugBitrate uint64
 	hls          *hls.Server
+	audio        *audioState
 }
 
 type layerState struct {
@@ -54,7 +66,9 @@ type viewerConn struct {
 	mu           sync.RWMutex
 	pc           *webrtc.PeerConnection
 	sender       *webrtc.RTPSender
+	audioSender  *webrtc.RTPSender
 	outTrack     *webrtc.TrackLocalStaticRTP
+	audioTrack   *webrtc.TrackLocalStaticRTP
 	currentRID   string
 	currentLayer *layerState
 	lastSwitch   time.Time
@@ -97,8 +111,8 @@ func main() {
 	log.Println("SFU listening on :8080")
 	log.Printf("  HLS_DIR                   → %s", hlsDir)
 	log.Println("  GET  /                    → HTML viewer")
-	log.Println("  POST /broadcast           → broadcaster publishes 3 layers")
-	log.Println("  POST /subscribe?rid=h|m|l → viewer receives one layer")
+	log.Println("  POST /broadcast           → broadcaster publishes 3 video layers + audio")
+	log.Println("  POST /subscribe?rid=h|m|l → viewer receives one video layer + audio")
 	log.Println("  GET  /layers              → list layers with measured bitrate")
 	log.Println("  POST /debug/bitrate?bps=N → force bitrate (0 = clear)")
 	log.Println("  GET  /hls/info            → HLS availability snapshot (JSON)")
@@ -126,6 +140,15 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 	}
 
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		if track.Kind() == webrtc.RTPCodecTypeAudio {
+			log.Printf("[audio] arrived SSRC=%d", track.SSRC())
+			s.mu.Lock()
+			s.audio = &audioState{source: track}
+			s.mu.Unlock()
+			go s.forwardAudio(track)
+			return
+		}
+
 		rid := track.RID()
 		log.Printf("[layer %s] arrived SSRC=%d", rid, track.SSRC())
 
@@ -262,6 +285,7 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.broadcaster = nil
+		s.audio = nil
 		rids := make([]string, 0, len(s.layers))
 		for rid := range s.layers {
 			rids = append(rids, rid)
@@ -276,6 +300,13 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 
 	if _, err := pc.AddTransceiverFromKind(
 		webrtc.RTPCodecTypeVideo,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
+	); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := pc.AddTransceiverFromKind(
+		webrtc.RTPCodecTypeAudio,
 		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
 	); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -384,6 +415,31 @@ func (s *SFUServer) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		nextSeq:    uint16(time.Now().UnixNano() & 0xFFFF),
 	}
 
+	// Add audio only if the client offered an audio m-line. Otherwise
+	// the answer would have more m-lines than the offer, and strict
+	// clients would reject it.
+	if hasAudioMLine(offer.SDP) {
+		outAudio, err := webrtc.NewTrackLocalStaticRTP(opusCapability, "audio", "sfu")
+		if err != nil {
+			log.Printf("[viewer] create audio track: %v", err)
+		} else if audioSender, err := pc.AddTrack(outAudio); err != nil {
+			log.Printf("[viewer] add audio track: %v", err)
+		} else {
+			viewer.audioTrack = outAudio
+			viewer.audioSender = audioSender
+
+			// Drain RTCP so Pion doesn't block on the audio receive path.
+			go func() {
+				buf := make([]byte, 1500)
+				for {
+					if _, _, err := audioSender.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}
+
 	go func() {
 		buf := make([]byte, 1500)
 		for {
@@ -460,6 +516,18 @@ func (s *SFUServer) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(pc.LocalDescription())
+}
+
+// hasAudioMLine reports whether the SDP offer contains an audio media
+// section. Used to decide whether to add an audio track to the viewer's
+// answer without exceeding the offer's m-line count.
+func hasAudioMLine(sdp string) bool {
+	for _, line := range strings.Split(sdp, "\r\n") {
+		if strings.HasPrefix(line, "m=audio ") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *SFUServer) onREMB(v *viewerConn, bitrate uint64) {
@@ -683,6 +751,12 @@ func (s *SFUServer) killLayer(rid string) {
 	delete(s.layers, rid)
 	noLayersLeft := len(s.layers) == 0
 	bc := s.broadcaster
+	if noLayersLeft {
+		// The broadcaster PC is about to be closed (or already was),
+		// so the audio track on it is dead too. Clear the reference so
+		// forwardAudio for the next broadcaster starts clean.
+		s.audio = nil
+	}
 	s.mu.Unlock()
 
 	ls.mu.Lock()
@@ -770,6 +844,7 @@ func (s *SFUServer) handleReset(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	bc := s.broadcaster
 	s.broadcaster = nil
+	s.audio = nil
 	layers := s.layers
 	s.layers = make(map[string]*layerState)
 	s.mu.Unlock()
@@ -826,4 +901,48 @@ func newPeerConnection() (*webrtc.PeerConnection, error) {
 		webrtc.WithInterceptorRegistry(i),
 	)
 	return api.NewPeerConnection(webrtc.Configuration{})
+}
+
+// forwardAudio reads RTP from the broadcaster's audio track and writes
+// to every viewer's audioTrack. Audio SSRC/seq/ts are forwarded as-is:
+// there is only one audio source, so no rewriting is needed for layer
+// continuity across switches.
+func (s *SFUServer) forwardAudio(track *webrtc.TrackRemote) {
+	buf := make([]byte, 1500)
+	pkt := &rtp.Packet{}
+	for {
+		n, _, err := track.Read(buf)
+		if err != nil {
+			log.Printf("[audio] read error: %v", err)
+			return
+		}
+		if err := pkt.Unmarshal(buf[:n]); err != nil {
+			continue
+		}
+
+		// Collect viewers under a brief lock, then fan out without
+		// holding any lock while writing.
+		s.mu.RLock()
+		layers := make([]*layerState, 0, len(s.layers))
+		for _, ls := range s.layers {
+			layers = append(layers, ls)
+		}
+		s.mu.RUnlock()
+
+		var viewers []*viewerConn
+		for _, ls := range layers {
+			ls.mu.RLock()
+			viewers = append(viewers, ls.viewers...)
+			ls.mu.RUnlock()
+		}
+
+		for _, v := range viewers {
+			v.mu.RLock()
+			at := v.audioTrack
+			v.mu.RUnlock()
+			if at != nil {
+				_ = at.WriteRTP(pkt)
+			}
+		}
+	}
 }
