@@ -1,7 +1,6 @@
 # dualstream
 
 [![CI](https://github.com/rtagliaviaz/dualstream/actions/workflows/ci.yml/badge.svg)](https://github.com/rtagliaviaz/dualstream/actions/workflows/ci.yml)
-[![Go Report Card](https://goreportcard.com/badge/github.com/rtagliaviaz/dualstream)](https://goreportcard.com/report/github.com/rtagliaviaz/dualstream)
 [![Go Reference](https://pkg.go.dev/badge/github.com/rtagliaviaz/dualstream.svg)](https://pkg.go.dev/github.com/rtagliaviaz/dualstream)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
