@@ -16,6 +16,7 @@ import (
 	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/rtagliaviaz/dualstream/internal/hls"
 )
@@ -97,6 +98,8 @@ func main() {
 		hls:    hls.New(hlsDir),
 	}
 
+	registerMetrics(sfu)
+
 	http.Handle("/", http.FileServer(http.Dir("cmd/sfu/static")))
 	http.HandleFunc("/broadcast", sfu.handleBroadcast)
 	http.HandleFunc("/subscribe", sfu.handleSubscribe)
@@ -105,6 +108,7 @@ func main() {
 	http.HandleFunc("/hls/info", sfu.handleHLSInfo)
 	http.HandleFunc("/reset", sfu.handleReset)
 	http.Handle("/hls/", sfu.hls)
+	http.Handle("/metrics", promhttp.Handler())
 
 	go sfu.lifecycleMonitor()
 
@@ -118,6 +122,7 @@ func main() {
 	log.Println("  GET  /hls/info            → HLS availability snapshot (JSON)")
 	log.Println("  GET  /hls/master.m3u8     → HLS master playlist (fallback)")
 	log.Println("  POST /reset               → close broadcaster and all viewers")
+	log.Println("  GET  /metrics             → Prometheus exposition")
 	log.Fatal(http.ListenAndServe("0.0.0.0:8080", nil))
 }
 
@@ -219,6 +224,8 @@ func (s *SFUServer) handleBroadcast(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				bytesThisSecond.Add(uint64(n))
+				metricLayerPackets.WithLabelValues(rid).Inc()
+				metricLayerBytes.WithLabelValues(rid).Add(float64(n))
 				newLs.lastPacket.Store(time.Now().UnixNano())
 
 				newLs.mu.RLock()
@@ -563,6 +570,7 @@ func (s *SFUServer) onREMB(v *viewerConn, bitrate uint64) {
 		log.Printf("[switch] failed: %v", err)
 		return
 	}
+	metricSwitches.WithLabelValues(currentRID, targetRID).Inc()
 }
 
 func (s *SFUServer) requestKeyframe(rid string) error {
@@ -840,6 +848,7 @@ func (s *SFUServer) handleReset(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST required", http.StatusMethodNotAllowed)
 		return
 	}
+	metricResets.Inc()
 
 	s.mu.Lock()
 	bc := s.broadcaster
@@ -919,6 +928,7 @@ func (s *SFUServer) forwardAudio(track *webrtc.TrackRemote) {
 		if err := pkt.Unmarshal(buf[:n]); err != nil {
 			continue
 		}
+		metricAudioPackets.Inc()
 
 		// Collect viewers under a brief lock, then fan out without
 		// holding any lock while writing.

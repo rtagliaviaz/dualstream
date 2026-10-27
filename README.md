@@ -1,5 +1,8 @@
 # dualstream
 
+[![CI](https://github.com/rtagliaviaz/dualstream/actions/workflows/ci.yml/badge.svg)](https://github.com/rtagliaviaz/dualstream/actions/workflows/ci.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/rtagliaviaz/dualstream)](https://goreportcard.com/report/github.com/rtagliaviaz/dualstream)
+[![Go Reference](https://pkg.go.dev/badge/github.com/rtagliaviaz/dualstream.svg)](https://pkg.go.dev/github.com/rtagliaviaz/dualstream)
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -32,6 +35,7 @@ built from scratch with Pion and GStreamer.
   - [Latency](#latency)
   - [Storage hygiene](#storage-hygiene)
 - [Audio](#audio)
+- [Metrics](#metrics)
 - [What happens under the hood during a switch](#what-happens-under-the-hood-during-a-switch)
 - [Limitations](#limitations)
   - [UI layer detection requires distinct resolutions](#ui-layer-detection-requires-distinct-resolutions)
@@ -66,6 +70,9 @@ built from scratch with Pion and GStreamer.
   detected after 5 s of silence, viewers on dead layers are closed, and
   a new broadcaster connection transparently replaces the old one without
   restarting the SFU process.
+- Exposes **Prometheus metrics** at `/metrics` for per-layer bitrate,
+  viewer counts, switch events, broadcaster/audio state, and HLS
+  readiness. Standard `go_*` and `process_*` metrics are included.
 
 The broadcaster is a bridge that reads RTP packets from a GStreamer pipeline
 running on the same machine. The GStreamer pipeline produces three VP8
@@ -130,6 +137,7 @@ The Selective Forwarding Unit. It:
   cleans up layers and viewers accordingly.
 - Exposes `POST /reset` to force a clean slate without restarting the
   process.
+- Exposes Prometheus metrics at `/metrics` (see the Metrics section).
 
 ### `cmd/broadcaster-gst`
 
@@ -479,6 +487,85 @@ Browsers require muted autoplay by default. `player.js` unmutes the
 without breaking autoplay. If you never click on the page, audio stays
 muted — this is expected browser behavior, not a bug.
 
+## Metrics
+
+The SFU exposes a Prometheus endpoint at `/metrics`. It includes every
+metric listed below plus the standard Go runtime and process metrics
+that `promhttp` provides by default.
+
+### Exposed metrics
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `dualstream_broadcaster_up` | gauge | — | 1 if a broadcaster is connected, 0 otherwise |
+| `dualstream_audio_up` | gauge | — | 1 if an audio source is active, 0 otherwise |
+| `dualstream_viewers_total` | gauge | — | Total viewers across all layers |
+| `dualstream_layer_bitrate_bps` | gauge | `rid` | Measured bitrate of each layer |
+| `dualstream_layer_viewers` | gauge | `rid` | Viewers subscribed to each layer |
+| `dualstream_layer_packets_total` | counter | `rid` | Total RTP packets received per layer |
+| `dualstream_layer_bytes_total` | counter | `rid` | Total RTP payload bytes received per layer |
+| `dualstream_audio_packets_forwarded_total` | counter | — | Total audio packets read from broadcaster |
+| `dualstream_viewer_switches_total` | counter | `from`, `to` | Layer switches, labeled by source/target rid |
+| `dualstream_hls_variants_available` | gauge | — | Number of HLS variants ready on disk |
+| `dualstream_resets_total` | counter | — | Number of `POST /reset` calls served |
+
+Per-layer gauges (`bitrate_bps`, `viewers`) are computed at scrape time
+from live state, so they disappear cleanly when a layer is killed or
+replaced. Counters (`packets_total`, `bytes_total`) are monotonic
+across layer replacements and process start, which is the standard
+Prometheus convention.
+
+### Quick checks
+
+```bash
+curl -s http://localhost:8080/metrics | grep dualstream_
+```
+
+Example output with one viewer on layer `h`:
+
+```
+dualstream_audio_packets_forwarded_total 3247
+dualstream_audio_up 1
+dualstream_broadcaster_up 1
+dualstream_hls_variants_available 3
+dualstream_layer_bitrate_bps{rid="h"} 502144
+dualstream_layer_bitrate_bps{rid="l"} 124832
+dualstream_layer_bitrate_bps{rid="m"} 248608
+dualstream_layer_packets_total{rid="h"} 8932
+dualstream_layer_packets_total{rid="l"} 8932
+dualstream_layer_packets_total{rid="m"} 8932
+dualstream_layer_viewers{rid="h"} 1
+dualstream_layer_viewers{rid="l"} 0
+dualstream_layer_viewers{rid="m"} 0
+dualstream_resets_total 0
+dualstream_viewer_switches_total{from="h",to="m"} 1
+dualstream_viewers_total 1
+```
+
+### Wiring it to Prometheus + Grafana
+
+Point a Prometheus instance at the SFU:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: dualstream
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+```
+
+A few example queries for a dashboard:
+
+| Panel | Query |
+|-------|-------|
+| Layer bitrate | `dualstream_layer_bitrate_bps` |
+| Viewers per layer | `dualstream_layer_viewers` |
+| Broadcaster state | `dualstream_broadcaster_up` |
+| Switch rate (5m) | `rate(dualstream_viewer_switches_total[5m])` |
+| Audio packets/sec | `rate(dualstream_audio_packets_forwarded_total[1m])` |
+| HLS readiness | `dualstream_hls_variants_available` |
+
 ## What happens under the hood during a switch
 
 The naive way to switch layers is `RTPSender.ReplaceTrack()`. It does not
@@ -624,4 +711,4 @@ VP8 freeze entirely and is how production SFUs do it.
 
 ## License
 
-MIT
+This project is licensed under the MIT License - see the [LICENSE](./LICENSE) file for details.
